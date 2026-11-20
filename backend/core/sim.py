@@ -23,6 +23,7 @@ ARRIVE = 0.02       # 到点判定（米）
 ANGLE_ARRIVE = 0.02  # 转向到位判定（弧度）
 SUB_STEP = 0.02     # 积分步长（秒）
 LIDAR_RANGE = 5.0   # 雷达量程（米）
+QUEUE_MAX = 8       # 指令队列上限
 
 
 def wrap_angle(a: float) -> float:
@@ -115,6 +116,7 @@ class Robot:
         self._tx = self.x
         self._ty = self.y
         self._target_theta = self.theta
+        self._queue: List[Dict] = []
 
     def state(self) -> Dict[str, float | str | None]:
         return {
@@ -123,18 +125,22 @@ class Robot:
             "theta": round(wrap_angle(self.theta), 4),
             "status": self.status,
             "error": self.error,
+            "queue": len(self._queue),
         }
 
     def sensors(self, rays: int = 16) -> Dict[str, object]:
-        """返回三向距离与一圈扫描点。"""
-        scan: List[float] = []
+        """返回三向距离、一圈扫描点，以及带角度的射线（前端画扇形用）。"""
+        angles: List[float] = []
         for i in range(rays):
-            a = wrap_angle(-math.pi + 2 * math.pi * i / (rays - 1))
-            scan.append(round(self.map.raycast(self.x, self.y, self.theta + a), 3))
+            # 除以 rays（而非 rays-1），保证偶数条时正前方（0 弧度）恰好有一条射线
+            angles.append(wrap_angle(-math.pi + 2 * math.pi * i / rays))
+
+        scan: List[float] = [
+            round(self.map.raycast(self.x, self.y, self.theta + a), 3) for a in angles
+        ]
 
         def cone(center: float, half: float) -> float:
-            vals = [scan[i] for i in range(rays)
-                    if abs(wrap_angle(-math.pi + 2 * math.pi * i / (rays - 1) - center)) <= half]
+            vals = [scan[i] for i in range(rays) if abs(wrap_angle(angles[i] - center)) <= half]
             return round(min(vals), 3) if vals else round(LIDAR_RANGE, 3)
 
         return {
@@ -142,54 +148,76 @@ class Robot:
             "left": cone(math.pi / 2, math.pi / 8),
             "right": cone(-math.pi / 2, math.pi / 8),
             "scan": scan,
+            "rays": [{"a": round(a, 4), "d": d} for a, d in zip(angles, scan)],
         }
 
     # ---------------------------------------------------------------- 指令
     def apply(self, cmd: Dict) -> Dict[str, object]:
-        """执行一条指令，返回 {ok, code?, message?}。"""
+        """执行一条指令；正在移动时自动排队，队列满返回 BUSY。"""
         kind = cmd.get("type")
-        self.error = None
 
         if kind == "reset":
             self.reset()
             return {"ok": True}
 
         if kind == "stop":
+            self._queue.clear()
             self.mode = None
             self.status = "idle"
+            self.error = None
             return {"ok": True}
 
         if kind == "move":
-            distance = float(cmd.get("distance", 0.0))
-            if distance <= 0:
+            if float(cmd.get("distance", 0.0)) <= 0:
                 return self._fail("INVALID_COMMAND", "距离必须大于 0")
-            direction = cmd.get("direction", "forward")
-            hx, hy = math.cos(self.theta), math.sin(self.theta)
-            sign = -1.0 if direction == "backward" else 1.0
-            self._tx = self.x + hx * distance * sign
-            self._ty = self.y + hy * distance * sign
-            if self.map.blocked(self._tx, self._ty, self.radius):
-                # 目标点本身不可达：停在原地并给出原因
-                self.status = "error"
-                self.error = self._block_code(self._tx, self._ty)
-                self.mode = None
-                return self._fail(self.error, "目标点被边界或障碍占据")
-            self.mode = "back" if sign < 0 else "drive"
-            self.status = "moving"
-            return {"ok": True}
+        elif kind == "turn":
+            if float(cmd.get("angle", math.pi / 2)) == 0:
+                return self._fail("INVALID_COMMAND", "角度不能为 0")
+        else:
+            return self._fail("INVALID_COMMAND", f"未知指令: {kind!r}")
 
-        if kind == "turn":
+        if self.mode is not None:
+            if len(self._queue) >= QUEUE_MAX:
+                return self._fail("BUSY", "指令队列已满，稍后再试")
+            self._queue.append(dict(cmd))
+            return {"ok": True, "queued": True}
+
+        return self._start(cmd)
+
+    def _start(self, cmd: Dict) -> Dict[str, object]:
+        """立即开始执行一条已校验的指令。"""
+        self.error = None
+        if cmd["type"] == "turn":
             angle = float(cmd.get("angle", math.pi / 2))
             direction = cmd.get("direction", "left")
             delta = angle if direction == "left" else -angle
-            if delta == 0:
-                return self._fail("INVALID_COMMAND", "角度不能为 0")
             self._target_theta = wrap_angle(self.theta + delta)
             self.mode = "turn"
             self.status = "moving"
             return {"ok": True}
 
-        return self._fail("INVALID_COMMAND", f"未知指令: {kind!r}")
+        distance = float(cmd.get("distance", 0.0))
+        direction = cmd.get("direction", "forward")
+        hx, hy = math.cos(self.theta), math.sin(self.theta)
+        sign = -1.0 if direction == "backward" else 1.0
+        self._tx = self.x + hx * distance * sign
+        self._ty = self.y + hy * distance * sign
+        if self.map.blocked(self._tx, self._ty, self.radius):
+            # 目标点本身不可达：停在原地并给出原因
+            self.status = "error"
+            self.error = self._block_code(self._tx, self._ty)
+            self.mode = None
+            return self._fail(self.error, "目标点被边界或障碍占据")
+        self.mode = "back" if sign < 0 else "drive"
+        self.status = "moving"
+        return {"ok": True}
+
+    def _dequeue(self) -> bool:
+        """取下一条指令并开始；队列空返回 False。"""
+        if not self._queue:
+            return False
+        self._start(self._queue.pop(0))
+        return True
 
     # ---------------------------------------------------------------- 推进
     def advance(self, dt: float) -> Dict[str, float | str | None]:
@@ -203,7 +231,9 @@ class Robot:
         steps = max(1, int(math.ceil(dt / SUB_STEP)))
         h = dt / steps
         for _ in range(steps):
-            if self.status != "moving" or self.mode is None:
+            if self.status == "error":
+                break
+            if self.mode is None and not self._dequeue():
                 break
             self._substep(h)
         return self.state()

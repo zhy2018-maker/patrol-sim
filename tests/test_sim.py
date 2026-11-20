@@ -1,4 +1,4 @@
-"""仿真内核单元测试（对应方案 B6）。
+﻿"""仿真内核单元测试（对应方案 B6）。
 
 运行：
     cd handoff/code
@@ -100,6 +100,40 @@ class TestCollision(unittest.TestCase):
             self.assertLessEqual(robot.y, robot.map.height)
 
 
+class TestCommandQueue(unittest.TestCase):
+    def test_queue_runs_in_order(self):
+        robot = Robot(open_map(), 2.0, 2.0, 0.0)
+        robot.apply({"type": "move", "direction": "forward", "distance": 0.3})
+        res = robot.apply({"type": "move", "direction": "forward", "distance": 0.3})
+        self.assertTrue(res["ok"])
+        self.assertEqual(robot.state()["queue"], 1)
+        for _ in range(300):
+            robot.advance(0.02)
+        self.assertAlmostEqual(robot.x, 2.6, delta=0.02)
+        self.assertEqual(robot.state()["queue"], 0)
+        self.assertEqual(robot.status, "idle")
+
+    def test_stop_clears_queue(self):
+        robot = Robot(open_map(), 2.0, 2.0, 0.0)
+        robot.apply({"type": "move", "direction": "forward", "distance": 1.0})
+        robot.apply({"type": "move", "direction": "forward", "distance": 1.0})
+        robot.apply({"type": "stop"})
+        self.assertEqual(robot.state()["queue"], 0)
+        frozen = robot.x
+        robot.advance(1.0)
+        self.assertAlmostEqual(robot.x, frozen, delta=1e-9)
+
+    def test_queue_full_returns_busy(self):
+        robot = Robot(open_map(), 2.0, 2.0, 0.0)
+        robot.apply({"type": "move", "direction": "forward", "distance": 0.3})
+        for _ in range(8):
+            self.assertTrue(robot.apply({"type": "move", "direction": "forward", "distance": 0.3})["ok"])
+        res = robot.apply({"type": "move", "direction": "forward", "distance": 0.3})
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["code"], "BUSY")
+        self.assertEqual(robot.state()["queue"], 8)
+
+
 class TestStateAndSensors(unittest.TestCase):
     def test_status_lifecycle(self):
         robot = Robot(open_map(), 2.0, 2.0, 0.0)
@@ -128,6 +162,16 @@ class TestStateAndSensors(unittest.TestCase):
         robot.x = 2.0
         self.assertGreater(robot.sensors()["front"], front + 1.0)
 
+    def test_rays_have_angle_and_distance(self):
+        walls = [(r, 10) for r in range(12)]
+        robot = Robot(open_map(walls=walls), 4.0, 2.0, 0.0)
+        data = robot.sensors()
+        self.assertEqual(len(data["rays"]), 16)
+        self.assertEqual(set(data["rays"][0]), {"a", "d"})
+        # 第 8 条射线正对车头（角度 0），到墙约 1.0 m
+        self.assertAlmostEqual(data["rays"][8]["a"], 0.0, delta=1e-6)
+        self.assertAlmostEqual(data["rays"][8]["d"], 1.0, delta=0.06)
+
     def test_reset_restores_home(self):
         robot = Robot(open_map(), 2.0, 2.0, 0.0)
         robot.apply({"type": "move", "direction": "forward", "distance": 1.0})
@@ -140,3 +184,4 @@ class TestStateAndSensors(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
